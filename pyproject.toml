@@ -1,0 +1,37 @@
+[project]
+name = "claude-harness-main"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic",
+    "python-dotenv",
+    "pyyaml",
+]
+
+[project.scripts]
+taffy = "harness.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+    "**/.env",
+    "**/.env.*",
+    "**/__pycache__",
+    "**/*.py[cod]",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/harness",
+    "/src/code.py",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/sandbox",
+]
