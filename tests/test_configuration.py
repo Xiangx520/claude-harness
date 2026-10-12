@@ -111,6 +111,26 @@ class ConfigurationTests(unittest.TestCase):
                                     encoding="utf-8-sig")
         self.assertEqual(HarnessConfig.from_env().MODEL, "bom-model")
 
+    def test_worker_limits_defaults_and_project_overrides(self):
+        os.environ.update(MODEL_ID="worker", ANTHROPIC_API_KEY="key")
+        config = HarnessConfig.from_env()
+        self.assertEqual(config.MAX_TEAMMATES, 3)
+        self.assertEqual(config.WORKER_MAX_TURNS, 30)
+        self.write_global("MAX_TEAMMATES=4\nWORKER_MAX_TURNS=40\n")
+        self.project_env.write_text("MAX_TEAMMATES=2\nWORKER_MAX_TURNS=12\n", encoding="utf-8")
+        config = HarnessConfig.from_env()
+        self.assertEqual(config.MAX_TEAMMATES, 2)
+        self.assertEqual(config.WORKER_MAX_TURNS, 12)
+
+    def test_worker_limits_reject_invalid_environment_values(self):
+        os.environ.update(MODEL_ID="worker", ANTHROPIC_API_KEY="key")
+        for name in ["MAX_TEAMMATES", "WORKER_MAX_TURNS"]:
+            for invalid in ["0", "-1", "1.5", "invalid"]:
+                with self.subTest(name=name, invalid=invalid):
+                    with patch.dict(os.environ, {name: invalid}):
+                        with self.assertRaisesRegex(ConfigurationError, name):
+                            HarnessConfig.from_env()
+
     def test_goal_configuration_defaults_and_project_overrides(self):
         os.environ.update(MODEL_ID="worker", ANTHROPIC_API_KEY="key")
         config = HarnessConfig.from_env()

@@ -69,6 +69,8 @@ class HarnessRuntime:
         self.team.hooks = self.hooks
         self.team.tasks = self.tasks
         self.team.tools = self.tools
+        self.team.context = self.context
+        self.bus.context = self.context
         self.hooks.console = self.console
         self.subagents.context = self.context
         self.subagents.hooks = self.hooks

@@ -1,5 +1,6 @@
 """Tool result budgets, history compaction, and memory context."""
 
+import hashlib
 import json
 import re
 import time
@@ -9,10 +10,11 @@ from pathlib import Path
 class ContextManager:
     """Tool result budgets, history compaction, and memory context."""
 
-    def __init__(self, config, client):
+    def __init__(self, config, client, *, namespace: str = ""):
         self.config = config
         self.client = client
         self.sandbox = None
+        self.namespace = namespace
 
     def publish_artifact(self, path: Path):
         if self.sandbox:
@@ -22,13 +24,14 @@ class ContextManager:
             if result.startswith("Error:"):
                 raise RuntimeError(result)
 
-    def extract_text(self, content) -> str:
+    def extract_text(self, content, *, strip: bool = True) -> str:
         if not isinstance(content, list):
             return str(content)
-        return "\n".join(
-            getattr(block, "text", "")
+        text = "\n".join(
+            block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
             for block in content
-            if getattr(block, "type", None) == "text").strip()
+            if self.block_type(block) == "text")
+        return text.strip() if strip else text
 
     def has_tool_use(self, content) -> bool:
         # Do not rely on stop_reason alone; the concrete tool_use block is the
@@ -107,7 +110,12 @@ class ContextManager:
 
     def save_output(self, tool_use_id: str, output: str) -> Path:
         self.config.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(tool_use_id))[:120] or "unknown"
+        # Leave room for the worker namespace on Windows paths.
+        id_limit = 64 if self.namespace else 120
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(tool_use_id))[:id_limit] or "unknown"
+        if self.namespace:
+            digest = hashlib.sha256(output.encode("utf-8")).hexdigest()[:16]
+            safe_id = f"{self.namespace}_{safe_id}_{digest}"
         path = self.config.TOOL_RESULTS_DIR / f"{safe_id}.txt"
         path.write_text(output, encoding="utf-8")
         self.publish_artifact(path)
@@ -221,6 +229,37 @@ class ContextManager:
                 block.get("tool_use_id", "unknown"), output, preview_chars=1000)
             if len(replacement) < len(output):
                 block["content"] = replacement
+        return messages
+
+    def prepare_context(self, messages: list, active_request: str, *,
+                        retain_tail: bool = False) -> list:
+        """Budget a model conversation without memory or goal side effects."""
+        messages[:] = self.tool_result_budget(messages)
+        messages[:] = self.snip_compact(messages)
+        if self.estimate_size(messages) > self.config.CONTEXT_LIMIT:
+            target = int(self.config.CONTEXT_LIMIT * 0.8)
+            messages[:] = self.micro_compact(messages, target)
+            if self.estimate_size(messages) > self.config.CONTEXT_LIMIT:
+                messages[:] = self.fit_tool_results(messages, target)
+        if self.estimate_size(messages) > self.config.CONTEXT_LIMIT:
+            if retain_tail:
+                # Keep the latest exchange, including unseen tool results. The
+                # task and latest coordination are supplied separately from the
+                # factual summary so neither can disappear during compaction.
+                tail_start = next(
+                    (index for index in range(len(messages) - 1, -1, -1)
+                     if messages[index].get("role") == "assistant"),
+                    0,
+                )
+                tail = messages[tail_start:]
+                messages[:] = self.compact_history(messages[:tail_start], active_request) + tail
+                if self.estimate_size(messages) > self.config.CONTEXT_LIMIT:
+                    # An oversized exchange (e.g. tool input) cannot fit even
+                    # after outputs were persisted. Archive and summarize the
+                    # whole completed exchange; never split tool-use pairs.
+                    messages[:] = self.compact_history(messages, active_request)
+            else:
+                messages[:] = self.compact_history(messages, active_request)
         return messages
 
     def write_transcript(self, messages: list) -> Path:

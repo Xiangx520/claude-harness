@@ -1,5 +1,7 @@
 """Run a bounded subagent with a fresh conversation."""
 
+from .worker import AgentWorker
+
 
 class SubagentRunner:
     """Run a bounded subagent with a fresh conversation."""
@@ -48,32 +50,22 @@ class SubagentRunner:
         }
 
     def spawn_subagent(self, description: str) -> str:
-        messages = [{"role": "user", "content": description}]
-        for _ in range(30):
-            response = self.client.messages.create(
-                model=self.config.MODEL, system=self.SUB_SYSTEM, messages=messages,
-                tools=self.SUB_TOOLS, max_tokens=8000)
-            messages.append({"role": "assistant", "content": response.content})
-            if not self.context.has_tool_use(response.content):
-                break
-            results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                blocked = self.hooks.trigger_hooks("PreToolUse", block)
-                if blocked:
-                    output = str(blocked)
-                else:
-                    handler = self.SUB_HANDLERS.get(block.name)
-                    output = self.tools.call_tool_handler(handler, block.input, block.name)
-                    self.hooks.trigger_hooks("PostToolUse", block, output)
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": str(output)})
-            messages.append({"role": "user", "content": results})
-        for msg in reversed(messages):
-            if msg["role"] == "assistant":
-                text = self.context.extract_text(msg["content"])
-                if text:
-                    return text
-        return "Subagent finished without a text summary."
+        def execute(block):
+            blocked = self.hooks.trigger_hooks("PreToolUse", block)
+            if blocked is not None:
+                return str(blocked)
+            handler = self.SUB_HANDLERS.get(block.name)
+            output = self.tools.call_tool_handler(handler, block.input, block.name)
+            self.hooks.trigger_hooks("PostToolUse", block, output)
+            return output
+
+        try:
+            worker = AgentWorker(
+                self.config, self.client, self.context, system=self.SUB_SYSTEM,
+                tools=self.SUB_TOOLS, execute_tool=execute, description=description)
+            result = worker.run()
+        except Exception as exc:
+            return f"[Subagent error] {type(exc).__name__}: {exc}"
+        if result.status == "finished":
+            return result.text or "Subagent finished without a text summary."
+        return f"[Subagent {result.status}] {result.reason}"

@@ -20,16 +20,7 @@ class AgentLoop:
 
     def prepare_context(self, messages: list, active_request: str) -> list:
         # Every LLM turn enters through the same context budget pipeline.
-        messages[:] = self.context.tool_result_budget(messages)
-        messages[:] = self.context.snip_compact(messages)
-        if self.context.estimate_size(messages) > self.config.CONTEXT_LIMIT:
-            target = int(self.config.CONTEXT_LIMIT * 0.8)
-            messages[:] = self.context.micro_compact(messages, target)
-            if self.context.estimate_size(messages) > self.config.CONTEXT_LIMIT:
-                messages[:] = self.context.fit_tool_results(messages, target)
-        if self.context.estimate_size(messages) > self.config.CONTEXT_LIMIT:
-            messages[:] = self.context.compact_history(messages, active_request)
-        return messages
+        return self.context.prepare_context(messages, active_request)
 
     def build_user_content(self, results: list[dict]) -> list[dict]:
         # Tool results and completed background notifications are both returned to

@@ -5,11 +5,13 @@ import re
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 
 class MessageBus:
     def __init__(self, config):
         self.config = config
+        self.context = None
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self.MAILBOX_DIR = self.config.WORKDIR / ".mailboxes"
@@ -36,6 +38,10 @@ class MessageBus:
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message", metadata: dict | None = None):
+        # Persist before entering the mailbox lock; publishing may acquire the
+        # sandbox lock. Keep protocol identity outside the body unchanged.
+        if self.context:
+            content = self.context.persist_large_output("message_" + uuid4().hex, content)
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
                "ts": time.time(), "metadata": metadata or {}}

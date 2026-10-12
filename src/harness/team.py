@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from .models import ProtocolState
+from .worker import AgentWorker
 
 
 class TeamManager:
@@ -74,14 +75,6 @@ class TeamManager:
                 f"[{msg['type']}{suffix}] {msg['from']}: {msg['content']}"
             )
         return "[Team events]\n" + "\n".join(lines)
-
-    def _last_assistant_text(self, content) -> str:
-        for block in content:
-            if getattr(block, "type", None) == "text":
-                return block.text.strip()
-            if isinstance(block, dict) and block.get("type") == "text":
-                return str(block.get("text", "")).strip()
-        return ""
 
     def _run_teammate_tool(self, name: str, block, handlers: dict) -> str:
         gate = self.plan_gates.get(name, "not_required")
@@ -165,6 +158,10 @@ class TeamManager:
             if any(existing.casefold() == name.casefold()
                    for existing in self.active_teammates):
                 return f"Teammate '{name}' already exists"
+            if len(self.active_teammates) >= self.config.MAX_TEAMMATES:
+                return (f"Cannot spawn teammate '{name}': MAX_TEAMMATES "
+                        f"({self.config.MAX_TEAMMATES}) reached. "
+                        "Reuse an existing teammate or shut down an idle teammate.")
             self.active_teammates[name] = "working"
             self.plan_gates[name] = "required" if require_plan else "not_required"
             self.tasks.assignment_versions[name] = 0
@@ -172,13 +169,10 @@ class TeamManager:
         if task_id:
             try:
                 claimed = self.tasks.claim_task(task_id, owner=name)
-            except (FileNotFoundError, ValueError) as exc:
+            except Exception as exc:
                 claimed = f"Error: {exc}"
             if not claimed.startswith("Claimed "):
-                with self.team_lock:
-                    self.active_teammates.pop(name, None)
-                    self.plan_gates.pop(name, None)
-                    self.tasks.assignment_versions.pop(name, None)
+                self._release_teammate(name)
                 return f"Cannot spawn teammate '{name}': {claimed}"
 
         system = (f"You are '{name}', a {role}. "
@@ -192,7 +186,7 @@ class TeamManager:
                   "delivers your final text to Lead. Use send_message only for "
                   "intermediate coordination, and address the coordinator as 'lead'.")
 
-        def handle_inbox_message(name: str, msg: dict, messages: list):
+        def handle_inbox_message(name: str, msg: dict, worker):
             msg_type = msg.get("type", "message")
             meta = msg.get("metadata", {})
             req_id = meta.get("request_id", "")
@@ -200,7 +194,7 @@ class TeamManager:
             if msg_type == "shutdown_request":
                 accepted, notice = self.apply_shutdown_request(name, msg)
                 if not accepted:
-                    messages.append({"role": "user", "content": notice})
+                    worker.add_message(notice)
                     return False
                 req_id = notice
                 self.bus.send(name, "lead", "Shutting down gracefully.",
@@ -212,14 +206,11 @@ class TeamManager:
 
             if msg_type == "plan_approval_response":
                 _, notice = self.apply_plan_response(name, msg)
-                messages.append({"role": "user",
-                    "content": notice})
+                worker.add_message(notice)
             elif msg_type == "plan_request":
-                messages.append({"role": "user",
-                    "content": f"[Plan required] {msg['content']}"})
+                worker.add_message(f"[Plan required] {msg['content']}")
             elif msg_type == "message":
-                messages.append({"role": "user",
-                    "content": f"[Message from {msg['from']}] {msg['content']}"})
+                worker.add_message(f"[Message from {msg['from']}] {msg['content']}")
             return False
 
         def run_loop():
@@ -287,7 +278,6 @@ class TeamManager:
             if require_plan:
                 initial_prompt += ("\n\n[Plan required] Submit a plan and wait for "
                                    "Lead approval before bash, write_file, or edit_file.")
-            messages = [{"role": "user", "content": initial_prompt}]
             sub_tools = [
                 {"name": "bash", "description": "Run a shell command.",
                  "input_schema": {"type": "object",
@@ -356,42 +346,62 @@ class TeamManager:
                 "complete_task": _run_complete_task,
             }
 
-            should_stop = False
-            while not should_stop:
+            def before_turn(worker):
                 for msg in self.bus.read_inbox(name):
-                    if handle_inbox_message(name, msg, messages):
-                        should_stop = True
-                        break
-                if should_stop:
-                    break
+                    if handle_inbox_message(name, msg, worker):
+                        return True
                 with self.team_lock:
                     self.active_teammates[name] = "working"
-                try:
-                    response = self.client.messages.create(
-                        model=self.config.MODEL, system=system, messages=messages,
-                        tools=sub_tools, max_tokens=8000)
-                except Exception as exc:
-                    self.bus.send(name, "lead",
-                             f"{type(exc).__name__}: {exc}", "error")
-                    break
-                messages.append({"role": "assistant", "content": response.content})
-                tool_calls = [
-                    block for block in response.content if block.type == "tool_use"
-                ]
-                if tool_calls:
-                    results = []
-                    for block in tool_calls:
-                        output = self._run_teammate_tool(name, block, sub_handlers)
-                        results.append({"type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": str(output)})
-                    messages.append({"role": "user", "content": results})
-                    continue
+                return False
 
-                summary = self._last_assistant_text(response.content)
+            def active_request():
+                # Rebuild from the current assignment, rather than replaying
+                # the initial task after this persistent teammate moves on.
+                request = prompt
+                _, assigned_id = self.tasks.current_work_identity(name)
+                if assigned_id:
+                    task = self.tasks.load_task(assigned_id)
+                    request += (f"\n[Assigned task {task.id}] {task.subject}\n"
+                                f"{task.description}")
+                else:
+                    request += "\nNo active task assignment."
+                return request
+
+            def worker_system():
+                cwd, error = current_cwd()
+                workdir = (self.config.AGENT_WORKDIR if self.config.SANDBOX_MODE == "docker"
+                           else str(cwd or self.config.WORKDIR))
+                return (f"{system}\nEnvironment: {self.config.ENVIRONMENT_PROMPT}.\n"
+                        f"Working directory: {workdir}\n"
+                        f"Plan status: {self.plan_gates.get(name, 'not_required')}. "
+                        "If a plan is required or pending, do not execute bash, "
+                        "write_file or edit_file until approval.\n"
+                        f"Workspace assignment: {error or 'active'}")
+
+            worker = AgentWorker(
+                self.config, self.client, self.context, system=worker_system,
+                tools=sub_tools, description=initial_prompt,
+                execute_tool=lambda block: self._run_teammate_tool(name, block, sub_handlers),
+                before_turn=before_turn, active_request=active_request)
+            messages = worker.messages
+            should_stop = False
+            while not should_stop:
+                result = worker.run()
+                if result.status == "closed":
+                    break
+                work_version, assigned_id = self.tasks.current_work_identity(name)
+                metadata = {"task_id": assigned_id, "work_version": work_version,
+                            "execution_id": worker.execution_id,
+                            "status": result.status, "turns": result.turns}
+                if result.status != "finished":
+                    self.bus.send(name, "lead", f"[{result.status}] {result.reason}",
+                                  "error", metadata)
+                    break
+
+                summary = result.text
                 gate = self.plan_gates.get(name, "not_required")
                 if gate != "pending" and summary:
-                    self.bus.send(name, "lead", summary, "result")
+                    self.bus.send(name, "lead", summary, "result", metadata)
                 if gate == "pending":
                     with self.team_lock:
                         self.active_teammates[name] = "waiting_approval"
@@ -406,7 +416,7 @@ class TeamManager:
                     inbox = self.bus.wait_for_messages(name, self.IDLE_SCAN_INTERVAL)
                     if inbox:
                         for msg in inbox:
-                            if handle_inbox_message(name, msg, messages):
+                            if handle_inbox_message(name, msg, worker):
                                 should_stop = True
                                 break
                         if should_stop or messages[-1]["role"] == "user":
@@ -420,14 +430,10 @@ class TeamManager:
                         workdir = str(self.tasks.assignment_cwd(name))
                     except (FileNotFoundError, ValueError) as exc:
                         workdir = f"unavailable ({exc})"
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"[Auto-claimed task {task.id}] "
-                            f"{task.subject}\n{task.description}\n"
-                            f"Work directory: {workdir}"
-                        ),
-                    })
+                    worker.add_message(
+                        f"[Auto-claimed task {task.id}] "
+                        f"{task.subject}\n{task.description}\n"
+                        f"Work directory: {workdir}", new_task=True)
                     print(f"  \033[32m[idle] {name} claimed "
                           f"{task.id}: {task.subject}\033[0m")
                     break
@@ -441,30 +447,37 @@ class TeamManager:
                 except Exception:
                     pass
             finally:
-                try:
-                    self.tasks.release_teammate_assignment(name)
-                except Exception as exc:
-                    try:
-                        self.bus.send(
-                            name, "lead",
-                            f"Assignment cleanup failed: {type(exc).__name__}: {exc}",
-                            "error",
-                        )
-                    except Exception:
-                        pass
-                with self.team_lock:
-                    self.active_teammates.pop(name, None)
-                    self.plan_gates.pop(name, None)
-                    self.plan_request_ids.pop(name, None)
+                self._release_teammate(name)
                 print(f"  \033[32m[teammate] {name} finished\033[0m")
 
-        threading.Thread(target=run, daemon=True).start()
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception as exc:
+            self._release_teammate(name)
+            return f"Cannot spawn teammate '{name}': {type(exc).__name__}: {exc}"
         print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
         assigned = f" for {task_id}" if task_id else " without an initial Task"
         return (
             f"Teammate '{name}' spawned as {role}{assigned}. "
             "End this turn; the runtime will deliver its events."
         )
+
+    def _release_teammate(self, name: str):
+        """Return abandoned work and release a reserved slot on every exit path."""
+        try:
+            self.tasks.release_teammate_assignment(name)
+        except Exception as exc:
+            try:
+                self.bus.send(name, "lead",
+                              f"Assignment cleanup failed: {type(exc).__name__}: {exc}",
+                              "error")
+            except Exception:
+                pass
+        finally:
+            with self.team_lock:
+                self.active_teammates.pop(name, None)
+                self.plan_gates.pop(name, None)
+                self.plan_request_ids.pop(name, None)
 
     def _teammate_submit_plan(self, from_name: str, plan: str) -> str:
         with self.tasks.task_lock:

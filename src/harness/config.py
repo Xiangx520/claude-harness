@@ -16,6 +16,7 @@ class HarnessConfig:
                  fallback_model: str | None = None, *,
                  goal_evaluator_model: str | None = None,
                  max_turns: int | None = None, stop_hook_block_cap: int = 8,
+                 max_teammates: int = 3, worker_max_turns: int = 30,
                  sandbox_mode: str = "disabled", sandbox_image: str = "taffy-sandbox:1",
                  sandbox_docker_context: str = "default", sandbox_cpus: float = 1,
                  sandbox_memory_mb: int = 1024, sandbox_pids: int = 128,
@@ -25,6 +26,10 @@ class HarnessConfig:
             raise ConfigurationError("MAX_TURNS 必须是大于 0 的整数。")
         if stop_hook_block_cap < 1:
             raise ConfigurationError("GOAL_STOP_HOOK_BLOCK_CAP 必须是大于 0 的整数。")
+        for name, value in (("MAX_TEAMMATES", max_teammates),
+                            ("WORKER_MAX_TURNS", worker_max_turns)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ConfigurationError(f"{name} 必须是大于 0 的整数。")
         if sandbox_mode not in {"disabled", "docker"}:
             raise ConfigurationError("SANDBOX_MODE 必须为 docker 或 disabled。")
         if not math.isfinite(sandbox_cpus) or sandbox_cpus <= 0:
@@ -58,6 +63,8 @@ class HarnessConfig:
         self.GOAL_EVALUATOR_MAX_TOKENS = 512
         self.GOAL_STOP_HOOK_BLOCK_CAP = stop_hook_block_cap
         self.MAX_TURNS = max_turns
+        self.MAX_TEAMMATES = max_teammates
+        self.WORKER_MAX_TURNS = worker_max_turns
         self.SKILLS_DIR = self.WORKDIR / "skills"
         self.TRANSCRIPT_DIR = self.WORKDIR / ".transcripts"
         self.TOOL_RESULTS_DIR = self.WORKDIR / ".task_outputs" / "tool-results"
@@ -143,6 +150,8 @@ class HarnessConfig:
         return cls(workdir, model, os.getenv("FALLBACK_MODEL_ID"),
                    goal_evaluator_model=os.getenv("GOAL_EVALUATOR_MODEL_ID", "").strip() or None,
                    max_turns=positive_integer("MAX_TURNS"),
+                   max_teammates=positive_integer("MAX_TEAMMATES", 3),
+                   worker_max_turns=positive_integer("WORKER_MAX_TURNS", 30),
                    stop_hook_block_cap=positive_integer("GOAL_STOP_HOOK_BLOCK_CAP", 8),
                    sandbox_mode=os.getenv("SANDBOX_MODE", "docker").strip(),
                    sandbox_image=os.getenv("SANDBOX_IMAGE", "taffy-sandbox:1").strip(),

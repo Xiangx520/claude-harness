@@ -93,6 +93,25 @@ GOAL_STOP_HOOK_BLOCK_CAP=8
 
 实现来源：[s17_goal_loop/code.py](https://github.com/shareAI-lab/learn-claude-code/blob/main/s17_goal_loop/code.py)。本项目将示例的异步评估接口适配为现有同步主循环，并复用后台任务与团队消息机制。
 
+## 子 agent：同步任务与后台队友
+
+`task(description)` 创建独立对话，同步执行子任务并返回最后的文本；主 agent 等待返回后继续。`spawn_teammate(name, role, prompt, task_id?, require_plan?)` 启动后台线程，立即返回；队友通过消息总线回传结果，完成当前执行后进入 idle，等待消息或领取下一项任务。主 agent 在创建队友后结束当前轮次，由团队事件唤醒；它仍然可以在其他轮次直接读写代码、执行验证。
+
+两种入口共用 `AgentWorker` 的模型与工具循环，但保持各自的工具权限和任务目录规则。临时 subagent 不继承主 agent 的历史，也不能再创建 agent；队友保留自己的对话、任务分配、计划审批和关闭协议。模型结束当前执行不代表任务板任务已完成，队友仍需调用 `complete_task`。
+
+```dotenv
+# 后台队友数量上限，含 working、idle、waiting_approval、stopping
+MAX_TEAMMATES=3
+# 每次 task 或队友唤醒最多执行的模型轮数；idle 等待不计入
+WORKER_MAX_TURNS=30
+```
+
+两个参数必须是正整数，可在全局、进程或项目配置中覆盖。队友达到数量上限时立即拒绝新建请求，不认领任务、不创建线程；应复用已有队友或关闭空闲队友。同步 `task` 不占后台队友名额。线程启动失败或退出时释放名额，未完成任务退回任务板。达到执行轮数上限、模型输出被截断或执行异常时明确报告未完成；不会将中间文字作为成功摘要，截断响应中的工具调用不会执行。
+
+所有子 agent 在请求模型前执行上下文预算和历史压缩，保留当前任务、最新协调消息以及工具调用与结果的配对。超过现有 30,000 字符阈值的工具输出、最终文本和团队消息正文保存到 `.task_outputs/tool-results`，传递预览与完整内容路径，可通过文件工具按需读取。worker 产物使用独立执行 ID 命名，避免相同工具调用 ID 覆盖其他会话的结果；归档历史保存到 `.transcripts`。上下文阈值沿用序列化字符估算，不是精确 token 预算。
+
+本次提供数量、轮数和上下文保护，不提供任务排队、全局 token 预算、执行中暂停恢复或强制取消。关闭队友仍是现有的协作式关闭，后台 shell 仍遵守现有审批限制。
+
 ## 功能拆分
 
 | 文件 | 类 | 职责 |
@@ -113,7 +132,8 @@ GOAL_STOP_HOOK_BLOCK_CAP=8
 | `src/harness/bus.py` | `MessageBus` | 文件邮箱和消息等待 |
 | `src/harness/team.py` | `TeamManager` | 队友线程、计划审批和关闭协议 |
 | `src/harness/hooks.py` | `HookManager` | 权限、日志和生命周期 hook |
-| `src/harness/subagents.py` | `SubagentRunner` | 临时子代理 |
+| `src/harness/subagents.py` | `SubagentRunner` | 同步临时子代理适配器 |
+| `src/harness/worker.py` | `AgentWorker`、`WorkerResult` | 共享子 agent 循环、独立对话、上下文预算及结束状态 |
 | `src/harness/context.py` | `ContextManager` | 工具结果预算、压缩和记忆上下文 |
 | `src/harness/memory.py` | `MemorySystem` | 记忆存储、召回、提取和整理 |
 | `src/harness/recovery.py` | `RecoveryManager`、`RecoveryState` | 重试、备用模型和恢复状态 |
