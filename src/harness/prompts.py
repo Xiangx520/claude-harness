@@ -65,7 +65,10 @@ class PromptBuilder:
                     self.PROMPT_SECTIONS["compaction"]]
         sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
         sections.append("Skills catalog:\n" + self.skills.list_skills() +
-                        "\nUse load_skill(name) when a skill is relevant.")
+                        "\nUse load_skill(name) when a skill is relevant. Bind necessary skills "
+                        "explicitly with required_skills on task/spawn_teammate; children "
+                        "do not inherit your active skills. Optional skills load on demand.")
+        sections.append(self.skills.render_active())
         if context.get("memory_catalog"):
             sections.append(f"Memory catalog:\n{context['memory_catalog']}")
         if context.get("memories"):

@@ -545,6 +545,75 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("current instructions", observed[2]["system"])
         self.assertNotIn("obsolete instructions", observed[2]["system"])
 
+    def install_skill(self, name, content):
+        folder = self.root / "skills" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "SKILL.md").write_text(content, encoding="utf-8")
+        self.runtime.skills.scan_skills()
+
+    def test_skill_state_isolated_and_restored_after_compaction(self):
+        self.install_skill("required", "Original required guidance")
+        self.install_skill("optional", "Original optional guidance")
+        self.runtime.skills.load_skill("optional")
+        worker = self.worker(skills=self.runtime.skills, required_skills=["required"])
+        self.assertEqual(list(worker.skills.active), ["required"])
+        worker.messages[:] = worker.context.reactive_compact(worker.messages, "work")
+        observed = []
+        self.client.messages.create.side_effect = lambda **kw: observed.append(kw) or response()
+        self.assertEqual(worker.run().status, "finished")
+        self.assertIn("Original required guidance", observed[0]["system"])
+        self.assertEqual(list(self.runtime.skills.active), ["optional"])
+
+    def test_skill_budget_keeps_all_reload_entries_and_pagination(self):
+        self.install_skill("large", "x" * 20000)
+        self.install_skill("small", "tail guidance")
+        skills = self.runtime.skills.fork()
+        skills.load_skill("large")
+        skills.load_skill("small")
+        guidance = skills.render_active(600)
+        self.assertLessEqual(len(guidance), 600)
+        self.assertIn("name='small'", guidance)
+        self.assertIn("Truncated", skills.load_skill("large", limit=20))
+        self.assertEqual(skills.load_skill("large", offset=19995), "xxxxx")
+        self.assertEqual(skills.active["large"], "x" * 20000)
+
+    def test_required_skills_registered_in_full_without_guidance_budget(self):
+        original = "required-original-" * 2000 + "END_REQUIRED"
+        self.install_skill("required", original)
+        self.runtime.config.SKILL_GUIDANCE_BUDGET = 1
+        worker = self.worker(skills=self.runtime.skills, required_skills=["required"])
+        self.assertEqual(worker.skills.required["required"], original)
+        self.assertIn(original, worker.skills.render_active(budget=0))
+        observed = []
+        self.client.messages.create.side_effect = lambda **kw: observed.append(kw) or response()
+        self.assertEqual(worker.run().status, "finished")
+        worker.messages[:] = worker.context.reactive_compact(worker.messages, "work")
+        self.assertEqual(worker.run().status, "finished")
+        model_requests = [request for request in observed if "tools" in request]
+        self.assertEqual(len(model_requests), 2)
+        for request in model_requests:
+            self.assertIn(original, request["system"])
+        self.assertEqual(self.runtime.skills.active, {})
+
+    def test_missing_required_skill_prevents_model_and_thread_start(self):
+        self.assertIn("Required skill not found", self.runtime.subagents.spawn_subagent(
+            "work", required_skills=["missing"]))
+        with patch("harness.team.threading.Thread") as thread:
+            result = self.runtime.team.spawn_teammate_thread(
+                "worker", "tester", "work", required_skills=["missing"])
+        self.assertIn("Required skill not found", result)
+        thread.assert_not_called()
+        self.client.messages.create.assert_not_called()
+
+    def test_child_loads_optional_skill_with_hooks(self):
+        self.install_skill("optional", "Optional exact guidance")
+        self.client.messages.create.side_effect = [
+            response(calls=[tool("load_skill", {"name": "optional"})]), response()]
+        worker = self.worker(skills=self.runtime.skills, hooks=self.runtime.hooks)
+        self.assertEqual(worker.run().status, "finished")
+        self.assertIn("Optional exact guidance", self.client.messages.create.call_args.kwargs["system"])
+        self.assertEqual(self.runtime.skills.active, {})
+
     def test_limits_validate_constructor_values(self):
         for name in ["max_teammates", "worker_max_turns"]:
             for invalid in [0, -1, True, 1.5, "3"]:

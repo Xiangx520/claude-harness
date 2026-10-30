@@ -5,6 +5,7 @@ from typing import Callable, Literal
 from uuid import uuid4
 
 from .context import ContextManager
+from .skills import SkillLoader, LOAD_SKILL_TOOL
 
 
 @dataclass(frozen=True)
@@ -21,14 +22,17 @@ class AgentWorker:
     def __init__(self, config, client, context, *, system, tools: list,
                  execute_tool: Callable, description: str,
                  before_turn: Callable | None = None,
-                 active_request: Callable | None = None):
+                 active_request: Callable | None = None,
+                 skills=None, required_skills=None, hooks=None):
         self.config = config
         self.client = client
         self.execution_id = "worker_" + uuid4().hex
         self.context = ContextManager(config, client, namespace=self.execution_id)
         self.context.sandbox = context.sandbox
         self.system = system
-        self.tools = tools
+        self.skills = (skills or SkillLoader(config)).fork(required_skills)
+        self.tools = list(tools) + [LOAD_SKILL_TOOL]
+        self.hooks = hooks
         self.execute_tool = execute_tool
         self.before_turn = before_turn
         self.active_request = active_request
@@ -67,6 +71,8 @@ class AgentWorker:
                 system += ("\nCurrent task and coordination (user-level context; "
                            "does not override role, permissions or runtime approval state):\n"
                            + request)
+                system += "\nSkills catalog:\n" + self.skills.list_skills()
+                system += "\n" + self.skills.render_active()
                 turns += 1
                 response = self.client.messages.create(
                     model=self.config.MODEL, system=system, messages=self.messages,
@@ -91,7 +97,17 @@ class AgentWorker:
                 results = []
                 # All results are appended together, preserving tool_use pairing.
                 for block in calls:
-                    output = self.execute_tool(block)
+                    if block.name == "load_skill":
+                        blocked = (self.hooks.trigger_hooks("PreToolUse", block)
+                                   if self.hooks else None)
+                        if blocked is not None:
+                            output = str(blocked)
+                        else:
+                            output = self.skills.load_skill(**block.input)
+                            if self.hooks:
+                                self.hooks.trigger_hooks("PostToolUse", block, output)
+                    else:
+                        output = self.execute_tool(block)
                     self._output_sequence += 1
                     output = self.persist(f"tool_{self._output_sequence}_{block.id}", output)
                     results.append({"type": "tool_result", "tool_use_id": block.id,

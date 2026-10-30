@@ -148,7 +148,11 @@ class TeamManager:
 
     def spawn_teammate_thread(self, name: str, role: str, prompt: str,
                               task_id: str | None = None,
-                              require_plan: bool = False) -> str:
+                              require_plan: bool = False, required_skills=None) -> str:
+        try:
+            bound_skills = self.skills.fork(required_skills)
+        except ValueError as exc:
+            return f"Cannot spawn teammate: {exc}"
         if not self.bus.is_valid_agent_name(name):
             return ("Invalid teammate name: use 1-64 letters, digits, "
                     "underscores, or dashes")
@@ -382,7 +386,8 @@ class TeamManager:
                 self.config, self.client, self.context, system=worker_system,
                 tools=sub_tools, description=initial_prompt,
                 execute_tool=lambda block: self._run_teammate_tool(name, block, sub_handlers),
-                before_turn=before_turn, active_request=active_request)
+                before_turn=before_turn, active_request=active_request,
+                skills=bound_skills, required_skills=list(bound_skills.active), hooks=self.hooks)
             messages = worker.messages
             should_stop = False
             while not should_stop:
@@ -555,8 +560,8 @@ class TeamManager:
 
     def run_spawn_teammate(self, name: str, role: str, prompt: str,
                            task_id: str | None = None,
-                           require_plan: bool = False) -> str:
-        return self.spawn_teammate_thread(name, role, prompt, task_id, require_plan)
+                           require_plan: bool = False, required_skills=None) -> str:
+        return self.spawn_teammate_thread(name, role, prompt, task_id, require_plan, required_skills)
 
     def run_list_teammates(self) -> str:
         with self.team_lock:

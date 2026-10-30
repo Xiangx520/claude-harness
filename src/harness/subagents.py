@@ -49,7 +49,7 @@ class SubagentRunner:
             "glob": self.tools.run_glob,
         }
 
-    def spawn_subagent(self, description: str) -> str:
+    def spawn_subagent(self, description: str, required_skills=None) -> str:
         def execute(block):
             blocked = self.hooks.trigger_hooks("PreToolUse", block)
             if blocked is not None:
@@ -62,7 +62,8 @@ class SubagentRunner:
         try:
             worker = AgentWorker(
                 self.config, self.client, self.context, system=self.SUB_SYSTEM,
-                tools=self.SUB_TOOLS, execute_tool=execute, description=description)
+                tools=self.SUB_TOOLS, execute_tool=execute, description=description,
+                skills=self.skills, required_skills=required_skills, hooks=self.hooks)
             result = worker.run()
         except Exception as exc:
             return f"[Subagent error] {type(exc).__name__}: {exc}"

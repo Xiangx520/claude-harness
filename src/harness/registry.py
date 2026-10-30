@@ -1,6 +1,9 @@
 """Explicit builtin tool schemas and late-bound MCP handlers."""
 
 
+from .skills import LOAD_SKILL_TOOL
+
+
 class ToolRegistry:
     """Explicit builtin tool schemas and late-bound MCP handlers."""
 
@@ -47,13 +50,10 @@ class ToolRegistry:
             {"name": "task",
              "description": "Launch a focused subagent. Returns only its final summary.",
              "input_schema": {"type": "object",
-                              "properties": {"description": {"type": "string"}},
+                              "properties": {"description": {"type": "string"},
+                                             "required_skills": {"type": "array", "items": {"type": "string"}}},
                               "required": ["description"]}},
-            {"name": "load_skill",
-             "description": "Load the full content of a skill by name.",
-             "input_schema": {"type": "object",
-                              "properties": {"name": {"type": "string"}},
-                              "required": ["name"]}},
+            LOAD_SKILL_TOOL,
             {"name": "compact",
              "description": "Summarize earlier conversation and continue with compacted context.",
              "input_schema": {"type": "object",
@@ -121,7 +121,8 @@ class ToolRegistry:
                                                  "type": "string",
                                                  "pattern": "^task_[0-9a-f]{8}$",
                                              },
-                                             "require_plan": {"type": "boolean"}},
+                                             "require_plan": {"type": "boolean"},
+                                             "required_skills": {"type": "array", "items": {"type": "string"}}},
                               "required": ["name", "role", "prompt"]}},
             {"name": "list_teammates", "description": "List active teammates.",
              "input_schema": {"type": "object", "properties": {}, "required": []}},
