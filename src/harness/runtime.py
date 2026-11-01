@@ -113,8 +113,10 @@ class HarnessRuntime:
         try:
             if self.tools.sandbox:
                 self.tools.sandbox.prepare()
+            self.team.start_lease_monitor()
             self.cli.run()
         finally:
+            self.team.stop_lease_monitor()
             failing = sys.exc_info()[0] is not None
             try:
                 self.tools._stop_all_shell_processes()

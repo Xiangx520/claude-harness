@@ -13,6 +13,8 @@ class Task:
     owner: str | None
     blockedBy: list[str]
     worktree: str | None = None
+    lease_token: str | None = None
+    lease_expires_at: float | None = None
 
 
 @dataclass

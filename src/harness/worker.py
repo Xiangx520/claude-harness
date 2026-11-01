@@ -5,6 +5,7 @@ from typing import Callable, Literal
 from uuid import uuid4
 
 from .context import ContextManager
+from .idempotency import ToolJournal, invoke, journal_tools
 from .skills import SkillLoader, LOAD_SKILL_TOOL
 
 
@@ -23,7 +24,7 @@ class AgentWorker:
                  execute_tool: Callable, description: str,
                  before_turn: Callable | None = None,
                  active_request: Callable | None = None,
-                 skills=None, required_skills=None, hooks=None):
+                 skills=None, required_skills=None, hooks=None, progress=None, operation_scope=None):
         self.config = config
         self.client = client
         self.execution_id = "worker_" + uuid4().hex
@@ -31,8 +32,11 @@ class AgentWorker:
         self.context.sandbox = context.sandbox
         self.system = system
         self.skills = (skills or SkillLoader(config)).fork(required_skills)
-        self.tools = list(tools) + [LOAD_SKILL_TOOL]
+        self.tools = journal_tools(list(tools)) + [LOAD_SKILL_TOOL]
         self.hooks = hooks
+        self.progress = progress
+        self.operation_scope = operation_scope
+        self.journal = ToolJournal(config.WORKDIR)
         self.execute_tool = execute_tool
         self.before_turn = before_turn
         self.active_request = active_request
@@ -77,6 +81,8 @@ class AgentWorker:
                 response = self.client.messages.create(
                     model=self.config.MODEL, system=system, messages=self.messages,
                     tools=self.tools, max_tokens=self.config.DEFAULT_MAX_TOKENS)
+                if self.progress:
+                    self.progress()
                 # A truncated tool_use may be incomplete. Never dispatch it.
                 if response.stop_reason == "max_tokens":
                     return WorkerResult("output_truncated", reason=
@@ -107,7 +113,9 @@ class AgentWorker:
                             if self.hooks:
                                 self.hooks.trigger_hooks("PostToolUse", block, output)
                     else:
-                        output = self.execute_tool(block)
+                        output = invoke(
+                            self.journal, block, self.execution_id, self.execute_tool,
+                            self.operation_scope() if self.operation_scope else None)
                     self._output_sequence += 1
                     output = self.persist(f"tool_{self._output_sequence}_{block.id}", output)
                     results.append({"type": "tool_result", "tool_use_id": block.id,

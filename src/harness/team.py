@@ -2,10 +2,12 @@
 
 import random
 import threading
+import time
 from pathlib import Path
 
 from .models import ProtocolState
 from .worker import AgentWorker
+from .leases import WorkerLease
 
 
 class TeamManager:
@@ -20,6 +22,9 @@ class TeamManager:
         self.team_lock = threading.RLock()
         self.pending_requests: dict[str, ProtocolState] = {}
         self.IDLE_SCAN_INTERVAL = 2.0
+        self.worker_leases = {}
+        self._lease_stop = threading.Event()
+        self._lease_monitor = None
 
     def new_request_id(self) -> str:
         while True:
@@ -149,6 +154,7 @@ class TeamManager:
     def spawn_teammate_thread(self, name: str, role: str, prompt: str,
                               task_id: str | None = None,
                               require_plan: bool = False, required_skills=None) -> str:
+        self.reap_expired_workers()
         try:
             bound_skills = self.skills.fork(required_skills)
         except ValueError as exc:
@@ -169,6 +175,10 @@ class TeamManager:
             self.active_teammates[name] = "working"
             self.plan_gates[name] = "required" if require_plan else "not_required"
             self.tasks.assignment_versions[name] = 0
+            lease = WorkerLease(self.config.WORKER_LEASE_SECONDS,
+                                lambda token, deadline: self.tasks.renew_worker_lease(
+                                    name, token, deadline))
+            self.worker_leases[name] = lease
 
         if task_id:
             try:
@@ -176,7 +186,7 @@ class TeamManager:
             except Exception as exc:
                 claimed = f"Error: {exc}"
             if not claimed.startswith("Claimed "):
-                self._release_teammate(name)
+                self._release_teammate(name, lease.token)
                 return f"Cannot spawn teammate '{name}': {claimed}"
 
         system = (f"You are '{name}', a {role}. "
@@ -351,6 +361,10 @@ class TeamManager:
             }
 
             def before_turn(worker):
+                with lease.guard():
+                    return receive_before_turn(worker)
+
+            def receive_before_turn(worker):
                 for msg in self.bus.read_inbox(name):
                     if handle_inbox_message(name, msg, worker):
                         return True
@@ -382,10 +396,20 @@ class TeamManager:
                         "write_file or edit_file until approval.\n"
                         f"Workspace assignment: {error or 'active'}")
 
+            def execute(block):
+                with lease.guard():
+                    return self._run_teammate_tool(name, block, sub_handlers)
+
+            def check_progress():
+                with lease.guard():
+                    pass
+
             worker = AgentWorker(
                 self.config, self.client, self.context, system=worker_system,
                 tools=sub_tools, description=initial_prompt,
-                execute_tool=lambda block: self._run_teammate_tool(name, block, sub_handlers),
+                execute_tool=execute, progress=check_progress,
+                operation_scope=lambda: "task:" + str(self.tasks.current_work_identity(name)[1])
+                    if self.tasks.current_work_identity(name)[1] else worker.execution_id,
                 before_turn=before_turn, active_request=active_request,
                 skills=bound_skills, required_skills=list(bound_skills.active), hooks=self.hooks)
             messages = worker.messages
@@ -394,54 +418,61 @@ class TeamManager:
                 result = worker.run()
                 if result.status == "closed":
                     break
-                work_version, assigned_id = self.tasks.current_work_identity(name)
-                metadata = {"task_id": assigned_id, "work_version": work_version,
-                            "execution_id": worker.execution_id,
-                            "status": result.status, "turns": result.turns}
-                if result.status != "finished":
-                    self.bus.send(name, "lead", f"[{result.status}] {result.reason}",
-                                  "error", metadata)
-                    break
+                with lease.guard():
+                    lease.check()
+                    work_version, assigned_id = self.tasks.current_work_identity(name)
+                    metadata = {"task_id": assigned_id, "work_version": work_version,
+                                "execution_id": worker.execution_id,
+                                "status": result.status, "turns": result.turns}
+                    if result.status != "finished":
+                        self.bus.send(name, "lead", f"[{result.status}] {result.reason}",
+                                      "error", metadata)
+                        break
 
-                summary = result.text
-                gate = self.plan_gates.get(name, "not_required")
-                if gate != "pending" and summary:
-                    self.bus.send(name, "lead", summary, "result", metadata)
-                if gate == "pending":
-                    with self.team_lock:
-                        self.active_teammates[name] = "waiting_approval"
-                else:
-                    self.tasks.release_completed_assignment(name)
-                    with self.team_lock:
-                        self.active_teammates[name] = "idle"
-                    self.bus.send(name, "lead", "Waiting for more work.",
-                             "idle_notification")
+                    summary = result.text
+                    gate = self.plan_gates.get(name, "not_required")
+                    if gate != "pending" and summary:
+                        self.bus.send(name, "lead", summary, "result", metadata)
+                    if gate == "pending":
+                        with self.team_lock:
+                            self.active_teammates[name] = "waiting_approval"
+                    else:
+                        self.tasks.release_completed_assignment(name)
+                        with self.team_lock:
+                            self.active_teammates[name] = "idle"
+                        self.bus.send(name, "lead", "Waiting for more work.",
+                                 "idle_notification")
 
                 while True:
-                    inbox = self.bus.wait_for_messages(name, self.IDLE_SCAN_INTERVAL)
-                    if inbox:
-                        for msg in inbox:
-                            if handle_inbox_message(name, msg, worker):
-                                should_stop = True
+                    with lease.guard():
+                        pass
+                    inbox = self.bus.wait_for_messages(name, min(
+                        self.IDLE_SCAN_INTERVAL, self.config.WORKER_LEASE_SECONDS / 3))
+                    lease.check()
+                    with lease.guard():
+                        if inbox:
+                            for msg in inbox:
+                                if handle_inbox_message(name, msg, worker):
+                                    should_stop = True
+                                    break
+                            if should_stop or messages[-1]["role"] == "user":
                                 break
-                        if should_stop or messages[-1]["role"] == "user":
-                            break
-                        continue
+                            continue
 
-                    task = self.tasks.claim_next_task(name)
-                    if not task:
-                        continue
-                    try:
-                        workdir = str(self.tasks.assignment_cwd(name))
-                    except (FileNotFoundError, ValueError) as exc:
-                        workdir = f"unavailable ({exc})"
-                    worker.add_message(
-                        f"[Auto-claimed task {task.id}] "
-                        f"{task.subject}\n{task.description}\n"
-                        f"Work directory: {workdir}", new_task=True)
-                    print(f"  \033[32m[idle] {name} claimed "
-                          f"{task.id}: {task.subject}\033[0m")
-                    break
+                        task = self.tasks.claim_next_task(name)
+                        if not task:
+                            continue
+                        try:
+                            workdir = str(self.tasks.assignment_cwd(name))
+                        except (FileNotFoundError, ValueError) as exc:
+                            workdir = f"unavailable ({exc})"
+                        worker.add_message(
+                            f"[Auto-claimed task {task.id}] "
+                            f"{task.subject}\n{task.description}\n"
+                            f"Work directory: {workdir}", new_task=True)
+                        print(f"  \033[32m[idle] {name} claimed "
+                              f"{task.id}: {task.subject}\033[0m")
+                        break
 
         def run():
             try:
@@ -452,13 +483,13 @@ class TeamManager:
                 except Exception:
                     pass
             finally:
-                self._release_teammate(name)
+                self._release_teammate(name, lease.token)
                 print(f"  \033[32m[teammate] {name} finished\033[0m")
 
         try:
             threading.Thread(target=run, daemon=True).start()
         except Exception as exc:
-            self._release_teammate(name)
+            self._release_teammate(name, lease.token)
             return f"Cannot spawn teammate '{name}': {type(exc).__name__}: {exc}"
         print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
         assigned = f" for {task_id}" if task_id else " without an initial Task"
@@ -467,8 +498,20 @@ class TeamManager:
             "End this turn; the runtime will deliver its events."
         )
 
-    def _release_teammate(self, name: str):
-        """Return abandoned work and release a reserved slot on every exit path."""
+    def _release_teammate(self, name: str, token=None):
+        """An old thread must never clean up its replacement's assignment."""
+        lease = self.worker_leases.get(name)
+        if lease is not None:
+            with lease.lock:
+                if not lease.valid or (token is not None and lease.token != token):
+                    return
+                self._release_worker(name, lease)
+        elif token is None:
+            self._release_worker(name, None)
+
+    def _release_worker(self, name, lease):
+        if lease:
+            lease.valid = False
         try:
             self.tasks.release_teammate_assignment(name)
         except Exception as exc:
@@ -481,8 +524,50 @@ class TeamManager:
         finally:
             with self.team_lock:
                 self.active_teammates.pop(name, None)
+                self.worker_leases.pop(name, None)
                 self.plan_gates.pop(name, None)
                 self.plan_request_ids.pop(name, None)
+
+    def start_lease_monitor(self):
+        if self._lease_monitor is not None:
+            return
+        self.reap_expired_workers()
+        self._lease_stop.clear()
+
+        def monitor():
+            while not self._lease_stop.wait(1):
+                try:
+                    self.reap_expired_workers()
+                except Exception as exc:
+                    print(f"[lease monitor error] {type(exc).__name__}: {exc}")
+
+        self._lease_monitor = threading.Thread(target=monitor, daemon=True)
+        self._lease_monitor.start()
+
+    def stop_lease_monitor(self):
+        self._lease_stop.set()
+        if self._lease_monitor:
+            self._lease_monitor.join(timeout=2)
+            self._lease_monitor = None
+
+    def reap_expired_workers(self):
+        with self.team_lock:
+            leases = list(self.worker_leases.items())
+        for name, lease in leases:
+            if not lease.lock.acquire(blocking=False):
+                continue  # A tool/critical section is still executing.
+            try:
+                if lease.valid and time.time() >= lease.deadline:
+                    self._release_teammate(name, lease.token)
+                    self.bus.send(name, "lead", "Worker heartbeat lease expired; task released",
+                                  "error", {"lease_token": lease.token})
+            finally:
+                lease.lock.release()
+        # Recover persisted assignments from a previous host process. One host
+        # per project is required; active local tools are deliberately protected.
+        with self.team_lock:
+            protected = set(self.worker_leases)
+        self.tasks.recover_expired_leases(protected_owners=protected)
 
     def _teammate_submit_plan(self, from_name: str, plan: str) -> str:
         with self.tasks.task_lock:

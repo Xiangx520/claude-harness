@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -243,6 +244,10 @@ class TaskSystem:
                 return f"Cannot claim {task_id}: {error}"
             task.owner = owner
             task.status = "in_progress"
+            lease = self.team.worker_leases.get(owner)
+            if lease:
+                task.lease_token = lease.token
+                task.lease_expires_at = time.time() + lease.seconds
             self.save_task(task)
             self.teammate_assignments[owner] = {"task_id": task.id, "cwd": cwd}
             self.advance_assignment_version(owner)
@@ -323,12 +328,38 @@ class TaskSystem:
                 if task:
                     task.status = "pending"
                     task.owner = None
+                    task.lease_token, task.lease_expires_at = None, None
                     self.save_task(task)
             finally:
                 self.teammate_assignments.pop(owner, None)
                 self.advance_assignment_version(owner)
                 if owner in self.team.plan_gates:
                     self.team.plan_gates[owner] = "not_required"
+
+    def renew_worker_lease(self, owner: str, token: str, expires_at: float):
+        with self.task_store_lock():
+            task = self._owner_in_progress(owner)
+            if task:
+                if task.lease_token not in (None, token):
+                    raise ValueError("Worker lease was replaced")
+                task.lease_token = token
+                task.lease_expires_at = expires_at
+                self.save_task(task)
+
+    def recover_expired_leases(self, now=None, protected_owners=()):
+        """Startup recovery; callers must not run two hosts on one task board."""
+        now = time.time() if now is None else now
+        recovered = []
+        with self.task_store_lock():
+            for task in self.list_tasks():
+                if (task.owner not in protected_owners and task.status == "in_progress"
+                        and task.lease_expires_at is not None
+                        and task.lease_expires_at <= now):
+                    task.status, task.owner = "pending", None
+                    task.lease_token, task.lease_expires_at = None, None
+                    self.save_task(task)
+                    recovered.append(task.id)
+        return recovered
 
     def scan_unclaimed_tasks(self) -> list[Task]:
         """Return ready tasks whose optional worktree binding is usable."""

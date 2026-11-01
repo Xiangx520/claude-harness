@@ -3,6 +3,8 @@
 import threading
 import time
 
+from uuid import uuid4
+from .idempotency import ToolJournal, invoke
 from .models import CronJob
 from .recovery import RecoveryState
 from .goal import StopDecision, usage_total
@@ -17,6 +19,8 @@ class AgentLoop:
         self.rounds_since_todo = 0
         self.total_tokens = 0
         self.agent_lock = threading.Lock()
+        self.execution_id = "lead_" + uuid4().hex
+        self.journal = ToolJournal(config.WORKDIR)
 
     def prepare_context(self, messages: list, active_request: str) -> list:
         # Every LLM turn enters through the same context budget pipeline.
@@ -187,9 +191,14 @@ class AgentLoop:
 
                 if self.background.should_run_background(block.name, block.input):
                     try:
-                        bg_id = self.background.start_background_task(block, handlers)
-                        output = (f"[Background task {bg_id} started] "
-                                  "Result will arrive as a task_notification.")
+                        def start_background(clean):
+                            bg_id = self.background.start_background_task(clean, handlers)
+                            return (f"[Background task {bg_id} started] "
+                                    "Result will arrive as a task_notification.")
+                        _, task_id = self.tasks.current_work_identity("agent")
+                        output = invoke(self.journal, block, self.execution_id,
+                                        start_background,
+                                        "task:" + task_id if task_id else self.execution_id)
                     except Exception as exc:
                         output = (f"Error: Failed to start background task: "
                                   f"{type(exc).__name__}: {exc}")
@@ -199,8 +208,14 @@ class AgentLoop:
                     continue
 
                 handler = handlers.get(block.name)
-                output = self.tools.call_tool_handler(handler, block.input, block.name)
-                self.hooks.trigger_hooks("PostToolUse", block, output)
+                _, task_id = self.tasks.current_work_identity("agent")
+                def execute(clean):
+                    result = self.tools.call_tool_handler(handler, clean.input, clean.name)
+                    self.hooks.trigger_hooks("PostToolUse", clean, result)
+                    return result
+                output = invoke(
+                    self.journal, block, self.execution_id, execute,
+                    "task:" + task_id if task_id else self.execution_id)
                 print(str(output)[:300])
 
                 if block.name == "todo_write":

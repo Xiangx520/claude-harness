@@ -17,6 +17,7 @@ class HarnessConfig:
                  goal_evaluator_model: str | None = None,
                  max_turns: int | None = None, stop_hook_block_cap: int = 8,
                  max_teammates: int = 3, worker_max_turns: int = 30,
+                 worker_lease_seconds: int = 300,
                  sandbox_mode: str = "disabled", sandbox_image: str = "taffy-sandbox:1",
                  sandbox_docker_context: str = "default", sandbox_cpus: float = 1,
                  sandbox_memory_mb: int = 1024, sandbox_pids: int = 128,
@@ -27,7 +28,8 @@ class HarnessConfig:
         if stop_hook_block_cap < 1:
             raise ConfigurationError("GOAL_STOP_HOOK_BLOCK_CAP 必须是大于 0 的整数。")
         for name, value in (("MAX_TEAMMATES", max_teammates),
-                            ("WORKER_MAX_TURNS", worker_max_turns)):
+                            ("WORKER_MAX_TURNS", worker_max_turns),
+                            ("WORKER_LEASE_SECONDS", worker_lease_seconds)):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ConfigurationError(f"{name} 必须是大于 0 的整数。")
         if sandbox_mode not in {"disabled", "docker"}:
@@ -65,6 +67,7 @@ class HarnessConfig:
         self.MAX_TURNS = max_turns
         self.MAX_TEAMMATES = max_teammates
         self.WORKER_MAX_TURNS = worker_max_turns
+        self.WORKER_LEASE_SECONDS = worker_lease_seconds
         self.SKILLS_DIR = self.WORKDIR / "skills"
         self.TRANSCRIPT_DIR = self.WORKDIR / ".transcripts"
         self.TOOL_RESULTS_DIR = self.WORKDIR / ".task_outputs" / "tool-results"
@@ -152,6 +155,7 @@ class HarnessConfig:
                    max_turns=positive_integer("MAX_TURNS"),
                    max_teammates=positive_integer("MAX_TEAMMATES", 3),
                    worker_max_turns=positive_integer("WORKER_MAX_TURNS", 30),
+                   worker_lease_seconds=positive_integer("WORKER_LEASE_SECONDS", 300),
                    stop_hook_block_cap=positive_integer("GOAL_STOP_HOOK_BLOCK_CAP", 8),
                    sandbox_mode=os.getenv("SANDBOX_MODE", "docker").strip(),
                    sandbox_image=os.getenv("SANDBOX_IMAGE", "taffy-sandbox:1").strip(),

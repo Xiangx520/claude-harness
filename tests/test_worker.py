@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -25,9 +26,9 @@ def response(text="done", *, calls=None, stop_reason="end_turn"):
         stop_reason=stop_reason)
 
 
-def tool(name="glob", args=None, tool_id="tool_same"):
+def tool(name="glob", args=None, tool_id=None):
     return SimpleNamespace(type="tool_use", name=name,
-                           input=args or {"pattern": "**/*"}, id=tool_id)
+                           input=args or {"pattern": "**/*"}, id=tool_id or "tool_" + uuid4().hex)
 
 
 class WorkerTests(unittest.TestCase):
@@ -148,7 +149,7 @@ class WorkerTests(unittest.TestCase):
         workers = [self.worker(execute_tool=lambda block: large) for _ in range(2)]
         paths = []
         for worker in workers:
-            self.client.messages.create.side_effect = [response(calls=[tool()]), response(large)]
+            self.client.messages.create.side_effect = [response(calls=[tool(tool_id="tool_same")]), response(large)]
             result = worker.run()
             self.assertEqual(result.status, "finished")
             tool_result = worker.messages[2]["content"][0]

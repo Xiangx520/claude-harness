@@ -1,6 +1,7 @@
 """Explicit builtin tool schemas and late-bound MCP handlers."""
 
 
+from .idempotency import journal_tools
 from .skills import LOAD_SKILL_TOOL
 
 
@@ -233,4 +234,4 @@ class ToolRegistry:
                     (server_name, raw_name), "confirm"
                 )
         self.hooks.mcp_tool_policies = policies
-        return tools, handlers
+        return journal_tools(tools), handlers
