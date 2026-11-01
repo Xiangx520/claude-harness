@@ -9,6 +9,7 @@ class BackgroundTaskManager:
     def __init__(self, config):
         self.config = config
         self._bg_counter = 0
+        self.bus = None
         self.background_tasks: dict[str, dict] = {}
         self.background_results: dict[str, str] = {}
         self.background_lock = threading.Lock()
@@ -42,6 +43,9 @@ class BackgroundTaskManager:
                 result = (f"Error: PostToolUse hook failed: "
                           f"{type(exc).__name__}: {exc}\n{result}")
                 status = "failed"
+            if self.bus:
+                # Durable mailbox receipt precedes in-memory completion/removal.
+                self.bus.send("background", "lead", f"[Background {bg_id} {status}] {command}\n{result}", metadata={"background_id": bg_id})
             with self.background_lock:
                 task = self.background_tasks.get(bg_id)
                 if task is None:
@@ -79,6 +83,8 @@ class BackgroundTaskManager:
                 for bg_id in ready
             ]
         notifications = []
+        if self.bus:
+            return notifications
         for bg_id, task, output in completed:
             summary = output[:200] if len(output) > 200 else output
             evidence = f"  <output>{output}</output>\n" if include_output else ""

@@ -5,6 +5,7 @@ import threading
 from .startup import show_startup_animation
 from .goal import CLEAR_ALIASES, GoalError
 from .sandbox import SandboxError
+from .sessions import SessionError
 
 
 class HarnessCLI:
@@ -14,6 +15,41 @@ class HarnessCLI:
     def submit_query(self, query: str, history: list, context: dict, session_state: dict):
         """Handle session commands locally, then enter the existing model/tool loop."""
         parts = query.strip().split(maxsplit=1)
+        agent = self.runtime.agent
+        if parts and parts[0] == "/session":
+            args = parts[1].split() if len(parts) > 1 else ["status"]
+            try:
+                if args == ["list"]:
+                    message = "\n".join(f"{sid} {updated:.0f}" for sid, updated in agent.store.list()) or "No saved sessions"
+                elif args == ["status"]:
+                    message = f"Session {agent.snapshot.session_id}; paused={agent.paused}; phase={(agent.loop_state or {}).get('phase', 'idle')}"
+                elif len(args) == 2 and args[0] == "resume":
+                    if self.runtime.background.has_unfinished_background() or self.runtime.team.active_teammates:
+                        raise SessionError("Wait for background tasks and teammates before switching sessions")
+                    message = agent.restore_session(args[1], history)
+                    session_state["active_user_request"] = agent.active_request
+                    context.update(self.runtime.context.update_context({}, history))
+                elif args == ["continue"]:
+                    if not agent.paused:
+                        raise SessionError("Session is not paused")
+                    if agent.loop_state is None:
+                        agent.paused = False
+                        message = "Session ready for a new request"
+                    else:
+                        start = len(history)
+                        decision = agent.agent_loop(history, context, agent.active_request, resume=True)
+                        context.update(self.runtime.context.update_context(context, history))
+                        agent.print_turn_assistants(history, start)
+                        return decision
+                else:
+                    message = "Usage: /session [list|status|resume <id>|continue]"
+            except SessionError as exc:
+                message = str(exc)
+            self.runtime.console.terminal_print(message)
+            return
+        if agent.paused:
+            self.runtime.console.terminal_print("Session paused. Use /session continue before submitting work.")
+            return
         if parts and parts[0] == "/sandbox":
             sandbox = self.runtime.tools.sandbox
             argument = parts[1].strip() if len(parts) > 1 else "status"
@@ -50,6 +86,7 @@ class HarnessCLI:
             argument = parts[1].strip()
             if argument.lower() in CLEAR_ALIASES:
                 self.runtime.console.terminal_print(self.runtime.goal.clear())
+                agent.checkpoint(history, session_state["active_user_request"])
                 return
             try:
                 self.runtime.goal.set_goal(argument, self.runtime.agent.total_tokens)
@@ -62,6 +99,8 @@ class HarnessCLI:
         turn_start = len(history)
         session_state["active_user_request"] = query
         history.append({"role": "user", "content": query})
+        agent.accept_request(query)
+        agent.checkpoint(history, query)
         decision = self.runtime.agent.agent_loop(history, context, query)
         context.update(self.runtime.context.update_context(context, history))
         self.runtime.agent.print_turn_assistants(history, turn_start)
@@ -86,5 +125,8 @@ class HarnessCLI:
             if query.strip().lower() in ("q", "exit", ""):
                 break
             with self.runtime.agent.agent_lock:
-                self.submit_query(query, history, context, session_state)
+                try:
+                    self.submit_query(query, history, context, session_state)
+                except SessionError as exc:
+                    self.runtime.console.terminal_print(str(exc))
             print()

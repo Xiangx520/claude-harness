@@ -12,6 +12,7 @@ class MessageBus:
     def __init__(self, config):
         self.config = config
         self.context = None
+        self.before_lead_consume = None
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self.MAILBOX_DIR = self.config.WORKDIR / ".mailboxes"
@@ -33,6 +34,8 @@ class MessageBus:
             return []
         msgs = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()
                 if line.strip()]
+        if agent == "lead" and self.before_lead_consume:
+            self.before_lead_consume(msgs)
         inbox.unlink()
         return msgs
 
@@ -42,7 +45,7 @@ class MessageBus:
         # sandbox lock. Keep protocol identity outside the body unchanged.
         if self.context:
             content = self.context.persist_large_output("message_" + uuid4().hex, content)
-        msg = {"from": from_agent, "to": to_agent,
+        msg = {"id": uuid4().hex, "from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
                "ts": time.time(), "metadata": metadata or {}}
         with self._changed:

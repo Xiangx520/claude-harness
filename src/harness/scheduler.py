@@ -5,6 +5,7 @@ import os
 import random
 import threading
 import time
+from uuid import uuid4
 from dataclasses import asdict
 from datetime import datetime
 
@@ -19,6 +20,7 @@ class CronScheduler:
         self.DURABLE_PATH = self.config.WORKDIR / ".scheduled_tasks.json"
         self.scheduled_jobs: dict[str, CronJob] = {}
         self.cron_queue: list[CronJob] = []
+        self.before_consume = None
         self.cron_lock = threading.RLock()
         self._last_fired: dict[str, str] = {}
         self._runtime_services_started = False
@@ -118,6 +120,9 @@ class CronScheduler:
                 if not self.validate_cron(job.cron):
                     self.scheduled_jobs[job.id] = job
                     if job.pending_delivery:
+                        if not job.delivery_id:
+                            job.delivery_id = uuid4().hex
+                            self.save_durable_jobs()
                         self.cron_queue.append(job)
         except Exception:
             pass
@@ -148,15 +153,15 @@ class CronScheduler:
         return f"Cancelled {job_id}"
 
     def _enqueue_due_job(self, job: CronJob):
-        """Persist a one-shot delivery before exposing it through the queue."""
-        if not job.recurring:
-            job.pending_delivery = True
-            try:
-                if job.durable:
-                    self.save_durable_jobs()
-            except Exception:
-                job.pending_delivery = False
-                raise
+        """Persist a delivery before exposing it through the queue."""
+        job.delivery_id = uuid4().hex
+        job.pending_delivery = True
+        try:
+            if job.durable:
+                self.save_durable_jobs()
+        except Exception:
+            job.pending_delivery = False
+            raise
         self.cron_queue.append(job)
 
     def cron_scheduler_loop(self):
@@ -178,6 +183,8 @@ class CronScheduler:
     def consume_cron_queue(self) -> list[CronJob]:
         with self.cron_lock:
             fired = list(self.cron_queue)
+            if self.before_consume:
+                self.before_consume(fired)
             self.cron_queue.clear()
         return fired
 
@@ -187,8 +194,11 @@ class CronScheduler:
         with self.cron_lock:
             for job in jobs:
                 current = self.scheduled_jobs.get(job.id)
-                if current and not current.recurring and current.pending_delivery:
-                    self.scheduled_jobs.pop(job.id, None)
+                if current and current.pending_delivery:
+                    if current.recurring:
+                        current.pending_delivery = False
+                    else:
+                        self.scheduled_jobs.pop(job.id, None)
                     durable_changed = durable_changed or current.durable
             if durable_changed:
                 self.save_durable_jobs()

@@ -384,7 +384,7 @@ class HarnessTests(unittest.TestCase):
         self.runtime.agent.agent_loop(messages, {}, "write result")
         self.assertEqual((self.root / "result.txt").read_text(encoding="utf-8"), "done")
         self.assertEqual(messages[2]["content"][0]["tool_use_id"], "tool_1")
-        self.assertEqual(messages[-1]["content"][0].text, "finished")
+        self.assertEqual(messages[-1]["content"][0]["text"], "finished")
 
     def test_agent_escalates_tokens_and_continues_without_first_partial(self):
         self.client.messages.create.side_effect = [

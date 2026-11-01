@@ -20,3 +20,5 @@ __pycache__/
 .sandbox_history/
 .sandbox_connection/
 .tools/
+
+.sessions/

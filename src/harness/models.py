@@ -38,3 +38,4 @@ class CronJob:
     recurring: bool
     durable: bool
     pending_delivery: bool = False
+    delivery_id: str = ""

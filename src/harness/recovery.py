@@ -1,6 +1,9 @@
 """Retry rate limits and overloads with the original fallback policy."""
 
+import math
 import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import time
 
 
@@ -11,6 +14,8 @@ class RecoveryState:
         self.consecutive_529 = 0
         self.has_attempted_reactive_compact = False
         self.current_model = primary_model
+        self.retry_attempt = 0
+        self.exhausted = False
 
 
 class RecoveryManager:
@@ -23,34 +28,78 @@ class RecoveryManager:
         base = min(self.config.BASE_DELAY_MS * (2 ** attempt), 32000) / 1000
         return base + random.uniform(0, base * 0.25)
 
-    def with_retry(self, fn, state: RecoveryState):
-        for attempt in range(self.config.MAX_RETRIES):
+    def classify(self, error):
+        if self.is_prompt_too_long_error(error):
+            return "context"
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            return "overload" if status == 529 else "transient" if status in {408, 409, 429} or status >= 500 else "fatal"
+        name = type(error).__name__.lower()
+        msg = str(error).lower()
+        if "529" in msg or "overloaded" in name or "overloaded" in msg:
+            return "overload"
+        if isinstance(error, (ConnectionError, TimeoutError)) or any(x in name for x in ("connection", "timeout", "ratelimit")) or "429" in msg:
+            return "transient"
+        return "fatal"
+
+    def with_retry(self, fn, state: RecoveryState, checkpoint=None):
+        def persist():
+            if checkpoint:
+                checkpoint()
+
+        def switch():
+            fallback = self.config.FALLBACK_MODEL
+            if fallback and fallback != state.current_model:
+                state.current_model = fallback
+                state.retry_attempt = 0
+                state.consecutive_529 = 0
+                print(f"  [recovery] switching to {fallback}")
+                persist()
+                return True
+            return False
+
+        while True:
+            if state.retry_attempt >= self.config.MAX_RETRIES:
+                if switch():
+                    continue
+                state.exhausted = True
+                persist()
+                raise RuntimeError(f"Max retries ({self.config.MAX_RETRIES}) exceeded; session paused")
+            state.retry_attempt += 1
+            persist()  # Charge the attempt durably before making the request.
             try:
                 result = fn()
-                state.consecutive_529 = 0
-                return result
-            except Exception as e:
-                name = type(e).__name__.lower()
-                msg = str(e).lower()
-                if "ratelimit" in name or "429" in msg:
-                    delay = self.retry_delay(attempt)
-                    print(f"  \033[33m[429] retry {attempt + 1}/{self.config.MAX_RETRIES} "
-                          f"after {delay:.1f}s\033[0m")
-                    time.sleep(delay)
-                    continue
-                if "overloaded" in name or "529" in msg or "overloaded" in msg:
+            except Exception as exc:
+                kind = self.classify(exc)
+                if kind not in {"transient", "overload"}:
+                    raise
+                if kind == "overload":
                     state.consecutive_529 += 1
-                    if state.consecutive_529 >= self.config.MAX_CONSECUTIVE_529 and self.config.FALLBACK_MODEL:
-                        state.current_model = self.config.FALLBACK_MODEL
-                        state.consecutive_529 = 0
-                        print(f"  \033[31m[529] switching to {self.config.FALLBACK_MODEL}\033[0m")
-                    delay = self.retry_delay(attempt)
-                    print(f"  \033[33m[529] retry {attempt + 1}/{self.config.MAX_RETRIES} "
-                          f"after {delay:.1f}s\033[0m")
-                    time.sleep(delay)
+                    if state.consecutive_529 >= self.config.MAX_CONSECUTIVE_529 and switch():
+                        continue
+                persist()
+                if state.retry_attempt >= self.config.MAX_RETRIES:
                     continue
-                raise
-        raise RuntimeError(f"Max retries ({self.config.MAX_RETRIES}) exceeded")
+                delay = self.retry_delay(state.retry_attempt - 1)
+                headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                hint = headers.get("retry-after")
+                if hint:
+                    try:
+                        try:
+                            seconds = float(hint)
+                        except ValueError:
+                            seconds = (parsedate_to_datetime(hint) - datetime.now(timezone.utc)).total_seconds()
+                        if math.isfinite(seconds):
+                            delay = max(delay, min(60.0, max(0.0, seconds)))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                print(f"  [recovery {kind}] attempt {state.retry_attempt}; wait {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            state.retry_attempt = 0
+            state.consecutive_529 = 0
+            state.exhausted = False
+            return result
 
     def is_prompt_too_long_error(self, e: Exception) -> bool:
         msg = str(e).lower()

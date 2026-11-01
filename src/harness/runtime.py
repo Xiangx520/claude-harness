@@ -26,13 +26,14 @@ from .agent import AgentLoop
 from .memory import MemorySystem
 from .goal import GoalController, PromptGoalEvaluator
 from .cli import HarnessCLI
+from .sessions import WorkspaceLock
 
 
 class HarnessRuntime:
     def __init__(self, config: HarnessConfig | None = None, client=None, *, goal_evaluator=None):
         self.config = config if config is not None else HarnessConfig.from_env()
         self.client = client if client is not None else Anthropic(
-            base_url=os.getenv("ANTHROPIC_BASE_URL"))
+            base_url=os.getenv("ANTHROPIC_BASE_URL"), max_retries=0)
         self.console = ConsoleBroker(self.config)
         self.tasks = TaskSystem(self.config)
         self.worktrees = WorktreeManager(self.config)
@@ -109,6 +110,10 @@ class HarnessRuntime:
         self.cli = HarnessCLI(self)
 
     def run(self):
+        with WorkspaceLock(self.config.WORKDIR):
+            self._run_locked()
+
+    def _run_locked(self):
         self.tools.install_process_cleanup()
         try:
             if self.tools.sandbox:
